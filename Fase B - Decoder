@@ -1,0 +1,206 @@
+import cv2
+import numpy as np
+
+# ==========================================
+# MATRICES Y FUNCIONES BASE (Misma lógica perfecta)
+# ==========================================
+H = np.array([
+    [1, 1, 0, 1,   1, 0, 0],
+    [1, 0, 1, 1,   0, 1, 0],
+    [0, 1, 1, 1,   0, 0, 1]
+], dtype=np.uint8)
+
+def find_fiducial_markers(image_gray):
+    blurred = cv2.GaussianBlur(image_gray, (5, 5), 0)
+    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    contours, hierarchy = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    marker_candidates = []
+    
+    if hierarchy is None: return np.array([], dtype=np.float32)
+
+    hierarchy = hierarchy[0]
+    
+    for i, contour in enumerate(contours):
+        child_idx = hierarchy[i][2]
+        if child_idx != -1:
+            grandchild_idx = hierarchy[child_idx][2]
+            if grandchild_idx == -1: 
+                x, y, w, h = cv2.boundingRect(contour)
+                aspect_ratio = float(w) / float(h)
+                area = cv2.contourArea(contour)
+                
+                if 0.6 <= aspect_ratio <= 1.4 and area > 50: 
+                    child_contour = contours[child_idx]
+                    M_parent = cv2.moments(contour)
+                    M_child = cv2.moments(child_contour)
+                    
+                    if M_parent["m00"] != 0 and M_child["m00"] != 0:
+                        cx = int(M_parent["m10"] / M_parent["m00"])
+                        cy = int(M_parent["m01"] / M_parent["m00"])
+                        cx_child = int(M_child["m10"] / M_child["m00"])
+                        cy_child = int(M_child["m01"] / M_child["m00"])
+                        dist = np.sqrt((cx - cx_child)**2 + (cy - cy_child)**2)
+                        
+                        if dist < 0.3 * w:
+                            marker_candidates.append([cx, cy, area])
+
+    if len(marker_candidates) >= 4:
+        marker_candidates.sort(key=lambda x: x[2], reverse=True)
+        return np.array([[pt[0], pt[1]] for pt in marker_candidates[:4]], dtype=np.float32)
+    else:
+        return np.array([[pt[0], pt[1]] for pt in marker_candidates], dtype=np.float32)
+
+def order_points(pts):
+    rect = np.zeros((4, 2), dtype=np.float32)
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)] 
+    rect[3] = pts[np.argmax(s)] 
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)] 
+    rect[2] = pts[np.argmax(diff)] 
+    return rect
+
+def warp_to_grid(image, markers, output_size=800):
+    markers_ordered = order_points(markers)
+    offset = 70 
+    dst_pts = np.array([
+        [offset, offset],
+        [output_size - offset, offset],
+        [offset, output_size - offset],
+        [output_size - offset, output_size - offset]
+    ], dtype=np.float32)
+    matrix = cv2.getPerspectiveTransform(markers_ordered, dst_pts)
+    return cv2.warpPerspective(image, matrix, (output_size, output_size))
+
+def hamming_decode(received_bits, verbose=False):
+    valid_len = len(received_bits) - (len(received_bits) % 7)
+    blocks = received_bits[:valid_len].reshape(-1, 7)
+    decoded_data = []
+    errores_corregidos = 0
+    
+    for block in blocks:
+        syndrome = np.dot(H, block) % 2
+        if np.any(syndrome != 0):
+            match = np.where(np.all(H.T == syndrome, axis=1))[0]
+            if len(match) > 0:
+                block[match[0]] ^= 1 
+                errores_corregidos += 1
+        decoded_data.extend(block[0:4])
+        
+    if verbose: print(f"Errores corregidos: {errores_corregidos}")
+    return np.array(decoded_data, dtype=np.uint8)
+
+def extract_and_decode(warped_grid, grid_size=40, verbose=False):
+    cell_size = warped_grid.shape[0] // grid_size
+    def get_cell_value(row, col):
+        cell = warped_grid[row*cell_size:(row+1)*cell_size, col*cell_size:(col+1)*cell_size]
+        margin = cell_size // 4
+        return np.mean(cell[margin:-margin, margin:-margin])
+
+    threshold = (get_cell_value(8, 0) + get_cell_value(8, 1)) / 2.0
+    
+    # --- LEER EL BIT DE SINCRONIZACIÓN ---
+    sync_bit = 1 if get_cell_value(8, 2) > threshold else 0
+    
+    mask = np.ones((grid_size, grid_size), dtype=bool)
+    marker_size = 7
+    mask[0:marker_size+2, 0:marker_size+2] = False 
+    mask[0:marker_size+1, grid_size-marker_size-1:grid_size] = False 
+    mask[grid_size-marker_size-1:grid_size, 0:marker_size+1] = False 
+    mask[grid_size-marker_size-1:grid_size, grid_size-marker_size-1:grid_size] = False 
+    
+    available_indices = np.where(mask)
+    manchester_symbols = [1 if get_cell_value(r, c) > threshold else 0 for r, c in zip(available_indices[0], available_indices[1])]
+
+    bits_canal = []
+    for i in range(0, len(manchester_symbols) - 1, 2):
+        pair = (manchester_symbols[i], manchester_symbols[i+1])
+        if pair == (1, 0): bits_canal.append(1)
+        elif pair == (0, 1): bits_canal.append(0)
+        else: bits_canal.append(0) 
+
+    bits_finales = hamming_decode(np.array(bits_canal, dtype=np.uint8), verbose)
+    
+    # Retornamos ambas cosas
+    return bits_finales, sync_bit
+
+def bits_to_text(bits):
+    valid_bits = bits[:len(bits) - (len(bits) % 8)]
+    text = ""
+    for i in range(0, len(valid_bits), 8):
+        char_code = int(''.join(str(b) for b in valid_bits[i:i+8]), 2)
+        text += chr(char_code) if 32 <= char_code <= 126 else "?" 
+    return text
+
+# ==========================================
+# BUCLE DE VIDEO EN TIEMPO REAL
+# ==========================================
+if __name__ == "__main__":
+    cap = cv2.VideoCapture(0)
+    
+    print("\n========================================================")
+    print("      ENLACE ÓPTICO EN VIVO (CON SINCRONIZACIÓN)        ")
+    print("========================================================")
+    
+    # --- MÁQUINA DE ESTADOS (MEMORIA) ---
+    ultimo_sync_leido = -1
+    conteo_estabilidad = 0
+    ultimo_frame_impreso = -1
+
+    while True:
+        ret, frame = cap.read()
+        if not ret: break
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        markers = find_fiducial_markers(gray)
+        img_debug = frame.copy()
+
+        color_puntos = (0, 255, 0) if len(markers) >= 4 else (0, 165, 255)
+        for (x, y) in markers:
+            cv2.circle(img_debug, (int(x), int(y)), 6, color_puntos, -1)
+
+        if len(markers) >= 4:
+            warped = warp_to_grid(frame, markers[:4], output_size=800)
+            cv2.imshow("Grilla Rectificada", cv2.resize(warped, (500, 500)))
+            
+            try:
+                # Recibimos el texto y el bit sincronizador
+                bits_recibidos, sync_bit = extract_and_decode(warped, verbose=False)
+                
+                # ANTIRREBOTE: Verificamos si el bit es el mismo que hace un instante
+                if sync_bit == ultimo_sync_leido:
+                    conteo_estabilidad += 1
+                else:
+                    ultimo_sync_leido = sync_bit
+                    conteo_estabilidad = 0 # Hubo ruido o cambio de frame, reiniciamos
+
+                # Si el frame lleva 3 lecturas estables (ya pasó la distorsión) 
+                # y NO lo hemos impreso todavía:
+                if conteo_estabilidad >= 3 and sync_bit != ultimo_frame_impreso:
+                    mensaje_actual = bits_to_text(bits_recibidos)
+                    mensaje_limpio = mensaje_actual.replace("?", "").strip()
+                    
+                    if len(mensaje_limpio) > 0:
+                        # Imprimir en consola de corrido
+                        print(mensaje_limpio, end=" ", flush=True)
+                        ultimo_frame_impreso = sync_bit # Marcar como ya impreso
+                
+                estado_txt = f"SYNC_BIT: {sync_bit} | ESTABLE: {conteo_estabilidad}"
+                cv2.putText(img_debug, estado_txt, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                
+            except Exception as e:
+                pass
+        else:
+            cv2.putText(img_debug, f"BUSCANDO... ({len(markers)}/4)", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
+            try: cv2.destroyWindow("Grilla Rectificada")
+            except: pass
+
+        cv2.imshow("Receptor VLC", img_debug)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            print("\n\n--- Conexión cerrada ---")
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
