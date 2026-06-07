@@ -2,205 +2,232 @@ import cv2
 import numpy as np
 
 # ==========================================
-# MATRICES Y FUNCIONES BASE (Misma lógica perfecta)
+# PARÁMETROS DEL SISTEMA
 # ==========================================
-H = np.array([
+# Matriz de Control de Paridad de Hamming (7,4) para detectar/corregir el error
+MATRIZ_H = np.array([
     [1, 1, 0, 1,   1, 0, 0],
     [1, 0, 1, 1,   0, 1, 0],
     [0, 1, 1, 1,   0, 0, 1]
 ], dtype=np.uint8)
 
-def find_fiducial_markers(image_gray):
-    blurred = cv2.GaussianBlur(image_gray, (5, 5), 0)
-    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+def encontrar_marcadores_fiduciales(imagen_escala_grises):
+    """Detecta los patrones cuadrados de las esquinas analizando los contornos."""
+    desenfoque = cv2.GaussianBlur(imagen_escala_grises, (5, 5), 0)
+    _, umbralizada = cv2.threshold(desenfoque, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     
-    contours, hierarchy = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    marker_candidates = []
+    contornos, jerarquia = cv2.findContours(umbralizada, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    candidatos_marcadores = []
     
-    if hierarchy is None: return np.array([], dtype=np.float32)
+    if jerarquia is None: 
+        return np.array([], dtype=np.float32)
 
-    hierarchy = hierarchy[0]
+    jerarquia = jerarquia[0]
     
-    for i, contour in enumerate(contours):
-        child_idx = hierarchy[i][2]
-        if child_idx != -1:
-            grandchild_idx = hierarchy[child_idx][2]
-            if grandchild_idx == -1: 
-                x, y, w, h = cv2.boundingRect(contour)
-                aspect_ratio = float(w) / float(h)
-                area = cv2.contourArea(contour)
+    # Buscamos la estructura del marcador: un contorno padre con un hijo y un nieto
+    for i, contorno in enumerate(contornos):
+        idx_hijo = jerarquia[i][2]
+        if idx_hijo != -1:
+            idx_nieto = jerarquia[idx_hijo][2]
+            if idx_nieto == -1: 
+                x, y, ancho, alto = cv2.boundingRect(contorno)
+                relacion_aspecto = float(ancho) / float(alto)
+                area = cv2.contourArea(contorno)
                 
-                if 0.6 <= aspect_ratio <= 1.4 and area > 50: 
-                    child_contour = contours[child_idx]
-                    M_parent = cv2.moments(contour)
-                    M_child = cv2.moments(child_contour)
+                # Tolerancia geométrica para detectar los cuadros
+                if 0.6 <= relacion_aspecto <= 1.4 and area > 50: 
+                    contorno_hijo = contornos[idx_hijo]
+                    M_padre = cv2.moments(contorno)
+                    M_hijo = cv2.moments(contorno_hijo)
                     
-                    if M_parent["m00"] != 0 and M_child["m00"] != 0:
-                        cx = int(M_parent["m10"] / M_parent["m00"])
-                        cy = int(M_parent["m01"] / M_parent["m00"])
-                        cx_child = int(M_child["m10"] / M_child["m00"])
-                        cy_child = int(M_child["m01"] / M_child["m00"])
-                        dist = np.sqrt((cx - cx_child)**2 + (cy - cy_child)**2)
+                    if M_padre["m00"] != 0 and M_hijo["m00"] != 0:
+                        cx = int(M_padre["m10"] / M_padre["m00"])
+                        cy = int(M_padre["m01"] / M_padre["m00"])
+                        cx_hijo = int(M_hijo["m10"] / M_hijo["m00"])
+                        cy_hijo = int(M_hijo["m01"] / M_hijo["m00"])
+                        distancia = np.sqrt((cx - cx_hijo)**2 + (cy - cy_hijo)**2)
                         
-                        if dist < 0.3 * w:
-                            marker_candidates.append([cx, cy, area])
+                        # Si los centros están muy cerca, es un candidato válido
+                        if distancia < 0.3 * ancho:
+                            candidatos_marcadores.append([cx, cy, area])
 
-    if len(marker_candidates) >= 4:
-        marker_candidates.sort(key=lambda x: x[2], reverse=True)
-        return np.array([[pt[0], pt[1]] for pt in marker_candidates[:4]], dtype=np.float32)
+    # Ordenar por área para quedarse con los 4 marcadores principales
+    if len(candidatos_marcadores) >= 4:
+        candidatos_marcadores.sort(key=lambda x: x[2], reverse=True)
+        return np.array([[pt[0], pt[1]] for pt in candidatos_marcadores[:4]], dtype=np.float32)
     else:
-        return np.array([[pt[0], pt[1]] for pt in marker_candidates], dtype=np.float32)
+        return np.array([[pt[0], pt[1]] for pt in candidatos_marcadores], dtype=np.float32)
 
-def order_points(pts):
-    rect = np.zeros((4, 2), dtype=np.float32)
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)] 
-    rect[3] = pts[np.argmax(s)] 
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)] 
-    rect[2] = pts[np.argmax(diff)] 
-    return rect
+def ordenar_puntos(puntos):
+    """Ordena los 4 puntos de la pantalla: SupIzquierda, SupDerecha, InfIzquierda, InfDerecha."""
+    rectangulo = np.zeros((4, 2), dtype=np.float32)
+    suma = puntos.sum(axis=1)
+    rectangulo[0] = puntos[np.argmin(suma)] 
+    rectangulo[3] = puntos[np.argmax(suma)] 
+    diferencia = np.diff(puntos, axis=1)
+    rectangulo[1] = puntos[np.argmin(diferencia)] 
+    rectangulo[2] = puntos[np.argmax(diferencia)] 
+    return rectangulo
 
-def warp_to_grid(image, markers, output_size=800):
-    markers_ordered = order_points(markers)
-    offset = 70 
-    dst_pts = np.array([
-        [offset, offset],
-        [output_size - offset, offset],
-        [offset, output_size - offset],
-        [output_size - offset, output_size - offset]
+def rectificar_grilla(imagen, marcadores, tamano_salida=800):
+    """Corrige la perspectiva (Homografía) transformando la región de interés a una vista cenital frontal."""
+    marcadores_ordenados = ordenar_puntos(marcadores)
+    desplazamiento = 70  # Compensación para no perder los bordes de la grilla
+    puntos_destino = np.array([
+        [desplazamiento, desplazamiento],
+        [tamano_salida - desplazamiento, desplazamiento],
+        [desplazamiento, tamano_salida - desplazamiento],
+        [tamano_salida - desplazamiento, tamano_salida - desplazamiento]
     ], dtype=np.float32)
-    matrix = cv2.getPerspectiveTransform(markers_ordered, dst_pts)
-    return cv2.warpPerspective(image, matrix, (output_size, output_size))
+    
+    matriz_transformacion = cv2.getPerspectiveTransform(marcadores_ordenados, puntos_destino)
+    return cv2.warpPerspective(imagen, matriz_transformacion, (tamano_salida, tamano_salida))
 
-def hamming_decode(received_bits, verbose=False):
-    valid_len = len(received_bits) - (len(received_bits) % 7)
-    blocks = received_bits[:valid_len].reshape(-1, 7)
-    decoded_data = []
+def decodificar_hamming(bits_recibidos, detallado=False):
+    """Decodifica el canal aplicando la matriz H y corrigiendo hasta 1 error por bloque."""
+    longitud_valida = len(bits_recibidos) - (len(bits_recibidos) % 7)
+    bloques = bits_recibidos[:longitud_valida].reshape(-1, 7)
+    datos_decodificados = []
     errores_corregidos = 0
     
-    for block in blocks:
-        syndrome = np.dot(H, block) % 2
-        if np.any(syndrome != 0):
-            match = np.where(np.all(H.T == syndrome, axis=1))[0]
-            if len(match) > 0:
-                block[match[0]] ^= 1 
+    for bloque in bloques:
+        sindrome = np.dot(MATRIZ_H, bloque) % 2
+        # Si el síndrome no es 0, hay error
+        if np.any(sindrome != 0):
+            coincidencia = np.where(np.all(MATRIZ_H.T == sindrome, axis=1))[0]
+            if len(coincidencia) > 0:
+                bloque[coincidencia[0]] ^= 1  # Voltea (invierte) el bit erróneo
                 errores_corregidos += 1
-        decoded_data.extend(block[0:4])
+        datos_decodificados.extend(bloque[0:4]) # Extrae solo la parte de datos (4 bits)
         
-    if verbose: print(f"Errores corregidos: {errores_corregidos}")
-    return np.array(decoded_data, dtype=np.uint8)
+    if detallado: 
+        print(f"Errores de canal corregidos automáticamente: {errores_corregidos}")
+    return np.array(datos_decodificados, dtype=np.uint8)
 
-def extract_and_decode(warped_grid, grid_size=40, verbose=False):
-    cell_size = warped_grid.shape[0] // grid_size
-    def get_cell_value(row, col):
-        cell = warped_grid[row*cell_size:(row+1)*cell_size, col*cell_size:(col+1)*cell_size]
-        margin = cell_size // 4
-        return np.mean(cell[margin:-margin, margin:-margin])
+def extraer_y_decodificar(grilla_rectificada, tamano_grilla=40, detallado=False):
+    """Toma la imagen plana, analiza la intensidad de las celdas y extrae el texto final."""
+    tamano_celda = grilla_rectificada.shape[0] // tamano_grilla
+    
+    def obtener_valor_celda(fila, columna):
+        """Muestrea el centro del macropíxel para evitar ruido de los bordes."""
+        celda = grilla_rectificada[fila*tamano_celda:(fila+1)*tamano_celda, columna*tamano_celda:(columna+1)*tamano_celda]
+        margen = tamano_celda // 4
+        return np.mean(celda[margen:-margen, margen:-margen])
 
-    threshold = (get_cell_value(8, 0) + get_cell_value(8, 1)) / 2.0
+    # AGC Dinámico (Control de ganancia automático): Promedio entre celda negra y blanca
+    umbral_decision = (obtener_valor_celda(8, 0) + obtener_valor_celda(8, 1)) / 2.0
     
     # --- LEER EL BIT DE SINCRONIZACIÓN ---
-    sync_bit = 1 if get_cell_value(8, 2) > threshold else 0
+    bit_sincronizacion = 1 if obtener_valor_celda(8, 2) > umbral_decision else 0
     
-    mask = np.ones((grid_size, grid_size), dtype=bool)
-    marker_size = 7
-    mask[0:marker_size+2, 0:marker_size+2] = False 
-    mask[0:marker_size+1, grid_size-marker_size-1:grid_size] = False 
-    mask[grid_size-marker_size-1:grid_size, 0:marker_size+1] = False 
-    mask[grid_size-marker_size-1:grid_size, grid_size-marker_size-1:grid_size] = False 
+    mascara_disponible = np.ones((tamano_grilla, tamano_grilla), dtype=bool)
+    tamano_marcador = 7
+    mascara_disponible[0:tamano_marcador+2, 0:tamano_marcador+2] = False 
+    mascara_disponible[0:tamano_marcador+1, tamano_grilla-tamano_marcador-1:tamano_grilla] = False 
+    mascara_disponible[tamano_grilla-tamano_marcador-1:tamano_grilla, 0:tamano_marcador+1] = False 
+    mascara_disponible[tamano_grilla-tamano_marcador-1:tamano_grilla, tamano_grilla-tamano_marcador-1:tamano_grilla] = False 
     
-    available_indices = np.where(mask)
-    manchester_symbols = [1 if get_cell_value(r, c) > threshold else 0 for r, c in zip(available_indices[0], available_indices[1])]
+    indices_disponibles = np.where(mascara_disponible)
+    
+    # Demapeo de celdas a Símbolos Manchester basado en la iluminación actual
+    simbolos_manchester = [1 if obtener_valor_celda(f, c) > umbral_decision else 0 for f, c in zip(indices_disponibles[0], indices_disponibles[1])]
 
+    # Decodificación Manchester (De pares de símbolos a un solo bit de canal)
     bits_canal = []
-    for i in range(0, len(manchester_symbols) - 1, 2):
-        pair = (manchester_symbols[i], manchester_symbols[i+1])
-        if pair == (1, 0): bits_canal.append(1)
-        elif pair == (0, 1): bits_canal.append(0)
-        else: bits_canal.append(0) 
+    for i in range(0, len(simbolos_manchester) - 1, 2):
+        par = (simbolos_manchester[i], simbolos_manchester[i+1])
+        if par == (1, 0): bits_canal.append(1)
+        elif par == (0, 1): bits_canal.append(0)
+        else: bits_canal.append(0) # Resolución conservadora en caso de ruido extremo
 
-    bits_finales = hamming_decode(np.array(bits_canal, dtype=np.uint8), verbose)
+    # Pasar bits de canal a bits netos de datos eliminando bits redundantes (Hamming)
+    bits_finales = decodificar_hamming(np.array(bits_canal, dtype=np.uint8), detallado)
     
-    # Retornamos ambas cosas
-    return bits_finales, sync_bit
+    return bits_finales, bit_sincronizacion
 
-def bits_to_text(bits):
-    valid_bits = bits[:len(bits) - (len(bits) % 8)]
-    text = ""
-    for i in range(0, len(valid_bits), 8):
-        char_code = int(''.join(str(b) for b in valid_bits[i:i+8]), 2)
-        text += chr(char_code) if 32 <= char_code <= 126 else "?" 
-    return text
+def bits_a_texto(bits):
+    """Mapeo final de grupo de 8 bits a sus correspondientes caracteres ASCII."""
+    bits_validos = bits[:len(bits) - (len(bits) % 8)]
+    texto_resultante = ""
+    for i in range(0, len(bits_validos), 8):
+        codigo_caracter = int(''.join(str(b) for b in bits_validos[i:i+8]), 2)
+        # Filtra que el valor sea un carácter imprimible ASCII convencional
+        texto_resultante += chr(codigo_caracter) if 32 <= codigo_caracter <= 126 else "?" 
+    return texto_resultante
 
 # ==========================================
-# BUCLE DE VIDEO EN TIEMPO REAL
+# CICLO DE VIDEO EN TIEMPO REAL
 # ==========================================
 if __name__ == "__main__":
-    cap = cv2.VideoCapture(0)
+    camara = cv2.VideoCapture(0) # 0 es usualmente la webcam principal
     
     print("\n========================================================")
     print("      ENLACE ÓPTICO EN VIVO (CON SINCRONIZACIÓN)        ")
     print("========================================================")
     
-    # --- MÁQUINA DE ESTADOS (MEMORIA) ---
+    # --- MÁQUINA DE ESTADOS (MEMORIA TEMPORAL) ---
+    # Sirve para manejar la desincronización y los efectos de transiciones entre cuadros de video
     ultimo_sync_leido = -1
     conteo_estabilidad = 0
-    ultimo_frame_impreso = -1
+    ultimo_cuadro_impreso = -1
 
     while True:
-        ret, frame = cap.read()
-        if not ret: break
+        retorno_valido, cuadro = camara.read()
+        if not retorno_valido: break
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        markers = find_fiducial_markers(gray)
-        img_debug = frame.copy()
+        escala_grises = cv2.cvtColor(cuadro, cv2.COLOR_BGR2GRAY)
+        marcadores = encontrar_marcadores_fiduciales(escala_grises)
+        imagen_depuracion = cuadro.copy()
 
-        color_puntos = (0, 255, 0) if len(markers) >= 4 else (0, 165, 255)
-        for (x, y) in markers:
-            cv2.circle(img_debug, (int(x), int(y)), 6, color_puntos, -1)
+        # Feedback visual de cuántos marcadores se detectan
+        color_puntos = (0, 255, 0) if len(marcadores) >= 4 else (0, 165, 255)
+        for (x, y) in marcadores:
+            cv2.circle(imagen_depuracion, (int(x), int(y)), 6, color_puntos, -1)
 
-        if len(markers) >= 4:
-            warped = warp_to_grid(frame, markers[:4], output_size=800)
-            cv2.imshow("Grilla Rectificada", cv2.resize(warped, (500, 500)))
+        # Si localiza automáticamente la pantalla (Fase B)
+        if len(marcadores) >= 4:
+            grilla_rectificada = rectificar_grilla(cuadro, marcadores[:4], tamano_salida=800)
+            cv2.imshow("Grilla Rectificada y Corregida", cv2.resize(grilla_rectificada, (500, 500)))
             
             try:
-                # Recibimos el texto y el bit sincronizador
-                bits_recibidos, sync_bit = extract_and_decode(warped, verbose=False)
+                # Recibimos la matriz de bits útiles y el bit indicador de cuadro
+                bits_recibidos, bit_sincronizacion = extraer_y_decodificar(grilla_rectificada, detallado=False)
                 
-                # ANTIRREBOTE: Verificamos si el bit es el mismo que hace un instante
-                if sync_bit == ultimo_sync_leido:
+                # LOGICA ANTIRREBOTE: Espera a que la lectura sea la misma consecutivamente
+                # Esto es vital para lidiar con el 'motion blur' (desenfoque por movimiento del monitor)
+                if bit_sincronizacion == ultimo_sync_leido:
                     conteo_estabilidad += 1
                 else:
-                    ultimo_sync_leido = sync_bit
-                    conteo_estabilidad = 0 # Hubo ruido o cambio de frame, reiniciamos
+                    ultimo_sync_leido = bit_sincronizacion
+                    conteo_estabilidad = 0 # El cuadro acaba de cambiar o hubo ruido, reiniciamos
 
-                # Si el frame lleva 3 lecturas estables (ya pasó la distorsión) 
-                # y NO lo hemos impreso todavía:
-                if conteo_estabilidad >= 3 and sync_bit != ultimo_frame_impreso:
-                    mensaje_actual = bits_to_text(bits_recibidos)
+                # Si ya lleva 3 frames capturados con datos estables y ese cuadro aún no se imprime:
+                if conteo_estabilidad >= 3 and bit_sincronizacion != ultimo_cuadro_impreso:
+                    mensaje_actual = bits_a_texto(bits_recibidos)
                     mensaje_limpio = mensaje_actual.replace("?", "").strip()
                     
                     if len(mensaje_limpio) > 0:
-                        # Imprimir en consola de corrido
+                        # Imprimir en consola de corrido, armando el mensaje en tiempo real
                         print(mensaje_limpio, end=" ", flush=True)
-                        ultimo_frame_impreso = sync_bit # Marcar como ya impreso
+                        ultimo_cuadro_impreso = bit_sincronizacion # Marca este cuadro para no repetirlo
                 
-                estado_txt = f"SYNC_BIT: {sync_bit} | ESTABLE: {conteo_estabilidad}"
-                cv2.putText(img_debug, estado_txt, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                estado_texto = f"BIT_SYNC: {bit_sincronizacion} | ESTABILIDAD: {conteo_estabilidad}"
+                cv2.putText(imagen_depuracion, estado_texto, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                 
             except Exception as e:
-                pass
+                pass # Si ocurre un error esporádico decodificando (por brillo súbito, manos, etc) se ignora
         else:
-            cv2.putText(img_debug, f"BUSCANDO... ({len(markers)}/4)", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
-            try: cv2.destroyWindow("Grilla Rectificada")
+            cv2.putText(imagen_depuracion, f"BUSCANDO PANTALLA... ({len(marcadores)}/4 esquinas)", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
+            try: cv2.destroyWindow("Grilla Rectificada y Corregida")
             except: pass
 
-        cv2.imshow("Receptor VLC", img_debug)
+        # Visualizar lo que percibe el receptor
+        cv2.imshow("Receptor VLC", imagen_depuracion)
 
+        # Cerrar el proceso de forma segura presionando 'q'
         if cv2.waitKey(1) & 0xFF == ord('q'):
-            print("\n\n--- Conexión cerrada ---")
+            print("\n\n--- Conexión finalizada por el usuario ---")
             break
 
-    cap.release()
+    camara.release()
     cv2.destroyAllWindows()
