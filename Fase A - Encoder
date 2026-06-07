@@ -1,0 +1,103 @@
+import numpy as np
+import cv2
+import math
+
+# Matriz Generadora de Hamming (7,4)
+G = np.array([
+    [1, 0, 0, 0,   1, 1, 0],
+    [0, 1, 0, 0,   1, 0, 1],
+    [0, 0, 1, 0,   0, 1, 1],
+    [0, 0, 0, 1,   1, 1, 1]
+], dtype=np.uint8)
+
+def text_to_bits(text: str) -> np.ndarray:
+    binary_string = ''.join(format(ord(char), '08b') for char in text)
+    return np.array([int(bit) for bit in binary_string], dtype=np.uint8)
+
+def hamming_encode(data_bits: np.ndarray) -> np.ndarray:
+    """Codificación de Canal: Añade 3 bits de paridad por cada 4 bits de datos."""
+    pad_len = (4 - len(data_bits) % 4) % 4
+    if pad_len > 0:
+        data_bits = np.pad(data_bits, (0, pad_len), 'constant', constant_values=0)
+        
+    blocks = data_bits.reshape(-1, 4)
+    encoded_blocks = np.dot(blocks, G) % 2
+    return encoded_blocks.flatten()
+
+def manchester_encode(bits: np.ndarray) -> np.ndarray:
+    manchester_symbols = np.zeros(len(bits) * 2, dtype=np.uint8)
+    manchester_symbols[0::2] = np.where(bits == 1, 1, 0)
+    manchester_symbols[1::2] = np.where(bits == 0, 1, 0)
+    return manchester_symbols
+
+def create_fiducial_marker(marker_size: int) -> np.ndarray:
+    marker = np.zeros((marker_size, marker_size), dtype=np.uint8)
+    marker[1:-1, 1:-1] = 1 
+    marker[2:-2, 2:-2] = 0
+    return marker
+
+def assemble_grid(manchester_symbols: np.ndarray, frame_idx: int = 0, grid_rows: int = 40, grid_cols: int = 40) -> np.ndarray:
+    grid = np.zeros((grid_rows, grid_cols), dtype=np.uint8)
+    marker_size = 7
+    marker = create_fiducial_marker(marker_size)
+    
+    grid[0:marker_size, 0:marker_size] = marker
+    grid[0:marker_size, grid_cols-marker_size:grid_cols] = marker
+    grid[grid_rows-marker_size:grid_rows, 0:marker_size] = marker
+    grid[grid_rows-marker_size:grid_rows, grid_cols-marker_size:grid_cols] = marker
+    
+    # Pilotos de Calibración
+    grid[marker_size+1, 0] = 1 # Blanco
+    grid[marker_size+1, 1] = 0 # Negro
+    
+    # --- LA MAGIA: El Bit de Sincronización (Toggle Bit) ---
+    grid[marker_size+1, 2] = 1 if frame_idx % 2 == 0 else 0
+    
+    mask = np.ones((grid_rows, grid_cols), dtype=bool)
+    mask[0:marker_size+2, 0:marker_size+2] = False # Esto ya oculta (8,0), (8,1) y ahora (8,2)
+    mask[0:marker_size+1, grid_cols-marker_size-1:grid_cols] = False 
+    mask[grid_rows-marker_size-1:grid_rows, 0:marker_size+1] = False 
+    mask[grid_rows-marker_size-1:grid_rows, grid_cols-marker_size-1:grid_cols] = False
+    
+    available_indices = np.where(mask)
+    grid[available_indices[0][:len(manchester_symbols)], available_indices[1][:len(manchester_symbols)]] = manchester_symbols
+    
+    return grid
+
+def render_frame(grid: np.ndarray, cell_size_px: int = 20) -> np.ndarray:
+    pixel_grid = grid * 255
+    return np.kron(pixel_grid, np.ones((cell_size_px, cell_size_px), dtype=np.uint8))
+
+if __name__ == "__main__":
+    mensaje_prueba = "La inteligencia artificial permite optimizar la creacion de contenidos de manera instantanea. Al redactar mensajes cortos es fundamental ir al grano para captar la atencion del lector de inmediato. Estructurar las ideas de forma clara y usar un lenguaje directo asegura que tu mensaje se entienda a la primera. Ya sea para redes sociales descripciones o microblogs la clave esta en priorizar la concision eliminar el relleno innecesario y aportar valor real en cada oracion"
+    
+    bits = text_to_bits(mensaje_prueba)
+    bits_protegidos = hamming_encode(bits)
+    simbolos_manchester = manchester_encode(bits_protegidos)
+    
+    celdas_utiles_por_frame = 1316
+    total_frames = math.ceil(len(simbolos_manchester) / celdas_utiles_por_frame)
+    
+    print(f"Fragmentando en {total_frames} cuadros...\n")
+    
+    # --- CONFIGURACIÓN DEL VIDEO ---
+    # Tamaño del frame: 40 celdas * 20px = 800x800
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+    out = cv2.VideoWriter('transmision_vlc.avi', fourcc, 1.0, (800, 800))
+    
+    for i in range(total_frames):
+        start_idx = i * celdas_utiles_por_frame
+        end_idx = min((i + 1) * celdas_utiles_por_frame, len(simbolos_manchester))
+        fragmento = simbolos_manchester[start_idx:end_idx]
+        
+        # Le pasamos 'i' para que el Toggle Bit alterne entre 1 y 0
+        grilla_logica = assemble_grid(fragmento, frame_idx=i)
+        frame_final = render_frame(grilla_logica, cell_size_px=20)
+        
+        cv2.imwrite(f"frame_{i}.png", frame_final)
+        frame_bgr = cv2.cvtColor(frame_final, cv2.COLOR_GRAY2BGR)
+        out.write(frame_bgr)
+        print(f"Frame {i} añadido al video (Sync Bit: {1 if i % 2 == 0 else 0}).")
+
+    out.release()
+    print("\n¡Transmisor finalizado! Video generado.")
