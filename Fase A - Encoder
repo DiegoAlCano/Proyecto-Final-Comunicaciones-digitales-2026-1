@@ -2,102 +2,129 @@ import numpy as np
 import cv2
 import math
 
-# Matriz Generadora de Hamming (7,4)
-G = np.array([
+# ==========================================
+# PARÁMETROS DEL SISTEMA
+# ==========================================
+# Matriz Generadora de Hamming (7,4) para control de errores
+MATRIZ_G = np.array([
     [1, 0, 0, 0,   1, 1, 0],
     [0, 1, 0, 0,   1, 0, 1],
     [0, 0, 1, 0,   0, 1, 1],
     [0, 0, 0, 1,   1, 1, 1]
 ], dtype=np.uint8)
 
-def text_to_bits(text: str) -> np.ndarray:
-    binary_string = ''.join(format(ord(char), '08b') for char in text)
-    return np.array([int(bit) for bit in binary_string], dtype=np.uint8)
+def texto_a_bits(texto: str) -> np.ndarray:
+    """Convierte una cadena de texto en un arreglo de bits (8 bits por carácter)."""
+    cadena_binaria = ''.join(format(ord(caracter), '08b') for caracter in texto)
+    return np.array([int(bit) for bit in cadena_binaria], dtype=np.uint8)
 
-def hamming_encode(data_bits: np.ndarray) -> np.ndarray:
-    """Codificación de Canal: Añade 3 bits de paridad por cada 4 bits de datos."""
-    pad_len = (4 - len(data_bits) % 4) % 4
-    if pad_len > 0:
-        data_bits = np.pad(data_bits, (0, pad_len), 'constant', constant_values=0)
+def codificar_hamming(bits_datos: np.ndarray) -> np.ndarray:
+    """
+    Codificación de Canal: Añade 3 bits de paridad por cada 4 bits de datos usando Hamming (7,4).
+    Esto protege la transmisión contra errores residuales del canal óptico.
+    """
+    # Rellenar con ceros si la longitud no es múltiplo de 4
+    longitud_relleno = (4 - len(bits_datos) % 4) % 4
+    if longitud_relleno > 0:
+        bits_datos = np.pad(bits_datos, (0, longitud_relleno), 'constant', constant_values=0)
         
-    blocks = data_bits.reshape(-1, 4)
-    encoded_blocks = np.dot(blocks, G) % 2
-    return encoded_blocks.flatten()
+    bloques = bits_datos.reshape(-1, 4)
+    bloques_codificados = np.dot(bloques, MATRIZ_G) % 2
+    return bloques_codificados.flatten()
 
-def manchester_encode(bits: np.ndarray) -> np.ndarray:
-    manchester_symbols = np.zeros(len(bits) * 2, dtype=np.uint8)
-    manchester_symbols[0::2] = np.where(bits == 1, 1, 0)
-    manchester_symbols[1::2] = np.where(bits == 0, 1, 0)
-    return manchester_symbols
+def codificar_manchester(bits: np.ndarray) -> np.ndarray:
+    """
+    Mapeo a símbolos: Aplica codificación Manchester para garantizar un balance de brillo
+    promedio (OOK - On-Off Keying). Cada '1' se vuelve '10' y cada '0' se vuelve '01'.
+    """
+    simbolos_manchester = np.zeros(len(bits) * 2, dtype=np.uint8)
+    simbolos_manchester[0::2] = np.where(bits == 1, 1, 0)
+    simbolos_manchester[1::2] = np.where(bits == 0, 1, 0)
+    return simbolos_manchester
 
-def create_fiducial_marker(marker_size: int) -> np.ndarray:
-    marker = np.zeros((marker_size, marker_size), dtype=np.uint8)
-    marker[1:-1, 1:-1] = 1 
-    marker[2:-2, 2:-2] = 0
-    return marker
+def crear_marcador_fiducial(tamano_marcador: int) -> np.ndarray:
+    """Crea un patrón tipo 'finder' similar a los códigos QR para la detección de esquinas."""
+    marcador = np.zeros((tamano_marcador, tamano_marcador), dtype=np.uint8)
+    marcador[1:-1, 1:-1] = 1 # frame blanco interior
+    marcador[2:-2, 2:-2] = 0 # Centro negro
+    return marcador
 
-def assemble_grid(manchester_symbols: np.ndarray, frame_idx: int = 0, grid_rows: int = 40, grid_cols: int = 40) -> np.ndarray:
-    grid = np.zeros((grid_rows, grid_cols), dtype=np.uint8)
-    marker_size = 7
-    marker = create_fiducial_marker(marker_size)
+def ensamblar_grilla(simbolos_manchester: np.ndarray, indice_frame: int = 0, filas_grilla: int = 40, columnas_grilla: int = 40) -> np.ndarray:
+    """
+    Diseña la grilla de transmisión: Ubica los marcadores en las esquinas, las celdas piloto
+    para calibración y distribuye los símbolos de datos en el espacio restante.
+    """
+    grilla = np.zeros((filas_grilla, columnas_grilla), dtype=np.uint8)
+    tamano_marcador = 7
+    marcador = crear_marcador_fiducial(tamano_marcador)
     
-    grid[0:marker_size, 0:marker_size] = marker
-    grid[0:marker_size, grid_cols-marker_size:grid_cols] = marker
-    grid[grid_rows-marker_size:grid_rows, 0:marker_size] = marker
-    grid[grid_rows-marker_size:grid_rows, grid_cols-marker_size:grid_cols] = marker
+    # Posicionar marcadores fiduciales en las 4 esquinas
+    grilla[0:tamano_marcador, 0:tamano_marcador] = marcador
+    grilla[0:tamano_marcador, columnas_grilla-tamano_marcador:columnas_grilla] = marcador
+    grilla[filas_grilla-tamano_marcador:filas_grilla, 0:tamano_marcador] = marcador
+    grilla[filas_grilla-tamano_marcador:filas_grilla, columnas_grilla-tamano_marcador:columnas_grilla] = marcador
     
-    # Pilotos de Calibración
-    grid[marker_size+1, 0] = 1 # Blanco
-    grid[marker_size+1, 1] = 0 # Negro
+    # Pilotos de Calibración de brillo/color (referencias estáticas)
+    grilla[tamano_marcador+1, 0] = 1 # Piloto Blanco (Luz)
+    grilla[tamano_marcador+1, 1] = 0 # Piloto Negro (Oscuridad)
     
-    # --- LA MAGIA: El Bit de Sincronización (Toggle Bit) ---
-    grid[marker_size+1, 2] = 1 if frame_idx % 2 == 0 else 0
+    # --- BIT DE SINCRONIZACIÓN (Toggle Bit) ---
+    # Alterna entre 1 y 0 con cada frame nuevo para avisarle al receptor que la trama cambió
+    grilla[tamano_marcador+1, 2] = 1 if indice_frame % 2 == 0 else 0
     
-    mask = np.ones((grid_rows, grid_cols), dtype=bool)
-    mask[0:marker_size+2, 0:marker_size+2] = False # Esto ya oculta (8,0), (8,1) y ahora (8,2)
-    mask[0:marker_size+1, grid_cols-marker_size-1:grid_cols] = False 
-    mask[grid_rows-marker_size-1:grid_rows, 0:marker_size+1] = False 
-    mask[grid_rows-marker_size-1:grid_rows, grid_cols-marker_size-1:grid_cols] = False
+    # Crear una máscara para saber qué celdas están libres para datos
+    mascara_disponible = np.ones((filas_grilla, columnas_grilla), dtype=bool)
+    # Bloquear zonas de marcadores y pilotos
+    mascara_disponible[0:tamano_marcador+2, 0:tamano_marcador+2] = False 
+    mascara_disponible[0:tamano_marcador+1, columnas_grilla-tamano_marcador-1:columnas_grilla] = False 
+    mascara_disponible[filas_grilla-tamano_marcador-1:filas_grilla, 0:tamano_marcador+1] = False 
+    mascara_disponible[filas_grilla-tamano_marcador-1:filas_grilla, columnas_grilla-tamano_marcador-1:columnas_grilla] = False
     
-    available_indices = np.where(mask)
-    grid[available_indices[0][:len(manchester_symbols)], available_indices[1][:len(manchester_symbols)]] = manchester_symbols
+    indices_disponibles = np.where(mascara_disponible)
     
-    return grid
+    # Insertar los datos en los espacios libres
+    grilla[indices_disponibles[0][:len(simbolos_manchester)], indices_disponibles[1][:len(simbolos_manchester)]] = simbolos_manchester
+    
+    return grilla
 
-def render_frame(grid: np.ndarray, cell_size_px: int = 20) -> np.ndarray:
-    pixel_grid = grid * 255
-    return np.kron(pixel_grid, np.ones((cell_size_px, cell_size_px), dtype=np.uint8))
+def renderizar_frame(grilla: np.ndarray, tamano_celda_px: int = 20) -> np.ndarray:
+    """Escala la matriz lógica (1s y 0s) a macropíxeles en una imagen en escala de grises."""
+    grilla_pixeles = grilla * 255 # Convertir binario a blanco (255) y negro (0)
+    # Expandir cada celda al tamaño deseado usando el producto de Kronecker
+    return np.kron(grilla_pixeles, np.ones((tamano_celda_px, tamano_celda_px), dtype=np.uint8))
 
 if __name__ == "__main__":
     mensaje_prueba = "La inteligencia artificial permite optimizar la creacion de contenidos de manera instantanea. Al redactar mensajes cortos es fundamental ir al grano para captar la atencion del lector de inmediato. Estructurar las ideas de forma clara y usar un lenguaje directo asegura que tu mensaje se entienda a la primera. Ya sea para redes sociales descripciones o microblogs la clave esta en priorizar la concision eliminar el relleno innecesario y aportar valor real en cada oracion"
     
-    bits = text_to_bits(mensaje_prueba)
-    bits_protegidos = hamming_encode(bits)
-    simbolos_manchester = manchester_encode(bits_protegidos)
+    bits = texto_a_bits(mensaje_prueba)
+    bits_protegidos = codificar_hamming(bits)
+    simbolos_manchester = codificar_manchester(bits_protegidos)
     
+    # Capacidad de la grilla (40x40 = 1600 celdas totales, restando marcadores quedan ~1316 útiles)
     celdas_utiles_por_frame = 1316
     total_frames = math.ceil(len(simbolos_manchester) / celdas_utiles_por_frame)
     
-    print(f"Fragmentando en {total_frames} cuadros...\n")
+    print(f"Fragmentando el mensaje en {total_frames} frames...\n")
     
     # --- CONFIGURACIÓN DEL VIDEO ---
-    # Tamaño del frame: 40 celdas * 20px = 800x800
-    fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    out = cv2.VideoWriter('transmision_vlc.avi', fourcc, 1.0, (800, 800))
+    # Tamaño del frame: 40 celdas * 20px = 800x800 píxeles
+    codigo_codec = cv2.VideoWriter_fourcc(*'XVID')
+    salida_video = cv2.VideoWriter('transmision_vlc.avi', codigo_codec, 1.0, (800, 800))
     
     for i in range(total_frames):
-        start_idx = i * celdas_utiles_por_frame
-        end_idx = min((i + 1) * celdas_utiles_por_frame, len(simbolos_manchester))
-        fragmento = simbolos_manchester[start_idx:end_idx]
+        inicio_idx = i * celdas_utiles_por_frame
+        fin_idx = min((i + 1) * celdas_utiles_por_frame, len(simbolos_manchester))
+        fragmento = simbolos_manchester[inicio_idx:fin_idx]
         
-        # Le pasamos 'i' para que el Toggle Bit alterne entre 1 y 0
-        grilla_logica = assemble_grid(fragmento, frame_idx=i)
-        frame_final = render_frame(grilla_logica, cell_size_px=20)
+        # Ensamblar la grilla pasando 'i' para que el Toggle Bit alterne correctamente
+        grilla_logica = ensamblar_grilla(fragmento, indice_frame=i)
+        frame_final = renderizar_frame(grilla_logica, tamano_celda_px=20)
         
+        # Guardar como PNG por si lo necesitas estático e insertarlo en el video
         cv2.imwrite(f"frame_{i}.png", frame_final)
         frame_bgr = cv2.cvtColor(frame_final, cv2.COLOR_GRAY2BGR)
-        out.write(frame_bgr)
-        print(f"Frame {i} añadido al video (Sync Bit: {1 if i % 2 == 0 else 0}).")
+        salida_video.write(frame_bgr)
+        print(f"frame {i} añadido al video (Bit de Sincronización: {1 if i % 2 == 0 else 0}).")
 
-    out.release()
-    print("\n¡Transmisor finalizado! Video generado.")
+    salida_video.release()
+    print("\n¡Transmisor finalizado! Video generado correctamente.")
