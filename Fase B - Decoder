@@ -14,7 +14,12 @@ MATRIZ_H = np.array([
 def encontrar_marcadores_fiduciales(imagen_escala_grises):
     """Detecta los patrones cuadrados de las esquinas analizando los contornos."""
     desenfoque = cv2.GaussianBlur(imagen_escala_grises, (5, 5), 0)
-    _, umbralizada = cv2.threshold(desenfoque, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    umbralizada = cv2.adaptiveThreshold(
+        desenfoque, 255, 
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+        cv2.THRESH_BINARY, 
+        15, 5
+    )
     
     contornos, jerarquia = cv2.findContours(umbralizada, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     candidatos_marcadores = []
@@ -23,7 +28,7 @@ def encontrar_marcadores_fiduciales(imagen_escala_grises):
         return np.array([], dtype=np.float32)
 
     jerarquia = jerarquia[0]
-    
+     
     # Buscamos la estructura del marcador: un contorno padre con un hijo y un nieto
     for i, contorno in enumerate(contornos):
         idx_hijo = jerarquia[i][2]
@@ -105,20 +110,22 @@ def decodificar_hamming(bits_recibidos, detallado=False):
     return np.array(datos_decodificados, dtype=np.uint8)
 
 def extraer_y_decodificar(grilla_rectificada, tamano_grilla=40, detallado=False):
-    """Toma la imagen plana, analiza la intensidad de las celdas y extrae el texto final."""
+    """Toma la imagen plana, analiza la intensidad de las celdas y extrae el texto final usando umbrales locales."""
     tamano_celda = grilla_rectificada.shape[0] // tamano_grilla
     
     def obtener_valor_celda(fila, columna):
-        """Muestrea el centro del macropíxel para evitar ruido de los bordes."""
+        """Muestrea exclusivamente el 'corazón' del macropíxel ignorando los bordes."""
         celda = grilla_rectificada[fila*tamano_celda:(fila+1)*tamano_celda, columna*tamano_celda:(columna+1)*tamano_celda]
-        margen = tamano_celda // 4
-        return np.mean(celda[margen:-margen, margen:-margen])
+        margen = int(tamano_celda * 0.35) 
+        centro = celda[margen:-margen, margen:-margen]
+        if centro.size == 0: 
+            return np.mean(celda) 
+        return np.mean(centro)
 
-    # AGC Dinámico (Control de ganancia automático): Promedio entre celda negra y blanca
-    umbral_decision = (obtener_valor_celda(8, 0) + obtener_valor_celda(8, 1)) / 2.0
-    
-    # --- LEER EL BIT DE SINCRONIZACIÓN ---
-    bit_sincronizacion = 1 if obtener_valor_celda(8, 2) > umbral_decision else 0
+    # Mantenemos un umbral local EXCLUSIVAMENTE para el bit de sincronización, 
+    # promediando solo las celdas piloto que están justo a su lado.
+    umbral_pilotos = (obtener_valor_celda(8, 0) + obtener_valor_celda(8, 1)) / 2.0
+    bit_sincronizacion = 1 if obtener_valor_celda(8, 2) > umbral_pilotos else 0
     
     mascara_disponible = np.ones((tamano_grilla, tamano_grilla), dtype=bool)
     tamano_marcador = 7
@@ -129,16 +136,21 @@ def extraer_y_decodificar(grilla_rectificada, tamano_grilla=40, detallado=False)
     
     indices_disponibles = np.where(mascara_disponible)
     
-    # Demapeo de celdas a Símbolos Manchester basado en la iluminación actual
-    simbolos_manchester = [1 if obtener_valor_celda(f, c) > umbral_decision else 0 for f, c in zip(indices_disponibles[0], indices_disponibles[1])]
+    # 1. Extraer las intensidades crudas (niveles de gris) de todas las celdas
+    intensidades = [obtener_valor_celda(f, c) for f, c in zip(indices_disponibles[0], indices_disponibles[1])]
 
-    # Decodificación Manchester (De pares de símbolos a un solo bit de canal)
+    # 2. Decodificación Manchester Diferencial (Umbralización Local)
     bits_canal = []
-    for i in range(0, len(simbolos_manchester) - 1, 2):
-        par = (simbolos_manchester[i], simbolos_manchester[i+1])
-        if par == (1, 0): bits_canal.append(1)
-        elif par == (0, 1): bits_canal.append(0)
-        else: bits_canal.append(0) # Resolución conservadora en caso de ruido extremo
+    for i in range(0, len(intensidades) - 1, 2):
+        intensidad_1 = intensidades[i]
+        intensidad_2 = intensidades[i+1]
+        
+        # Si la primera celda brilla más que la segunda, es un '1' lógico ('10' en Manchester)
+        if intensidad_1 > intensidad_2:
+            bits_canal.append(1)
+        # Si la segunda celda brilla más, es un '0' lógico ('01' en Manchester)
+        else:
+            bits_canal.append(0)
 
     # Pasar bits de canal a bits netos de datos eliminando bits redundantes (Hamming)
     bits_finales = decodificar_hamming(np.array(bits_canal, dtype=np.uint8), detallado)
@@ -155,6 +167,29 @@ def bits_a_texto(bits):
         texto_resultante += chr(codigo_caracter) if 32 <= codigo_caracter <= 126 else "?" 
     return texto_resultante
 
+def procesar_trama(bits_recibidos):
+    """Desempaqueta la cabecera (32 bits) y el payload del protocolo de tramas."""
+    if len(bits_recibidos) < 32:
+        return False, -1, 0, 0, ""
+
+    # Extraer los 4 bytes de cabecera
+    bytes_cabecera = []
+    for i in range(0, 32, 8):
+        val = int(''.join(str(b) for b in bits_recibidos[i:i+8]), 2)
+        bytes_cabecera.append(val)
+
+    preambulo, id_frame, total_frames, es_ultimo = bytes_cabecera
+
+    # Validar que sea un preámbulo real (0xAA = 170) para rechazar ruido aleatorio
+    if preambulo != 170:
+        return False, -1, 0, 0, ""
+
+    # Extraer y decodificar solo el payload
+    bits_payload = bits_recibidos[32:]
+    texto_payload = bits_a_texto(bits_payload).replace("?", "")
+
+    return True, id_frame, total_frames, es_ultimo, texto_payload
+
 # ==========================================
 # CICLO DE VIDEO EN TIEMPO REAL
 # ==========================================
@@ -162,69 +197,80 @@ if __name__ == "__main__":
     camara = cv2.VideoCapture(0) # 0 es usualmente la webcam principal
     
     print("\n========================================================")
-    print("      ENLACE ÓPTICO EN VIVO (CON SINCRONIZACIÓN)        ")
+    print("      ENLACE ÓPTICO EN VIVO (CON REDUNDANCIA TEMPORAL)      ")
     print("========================================================")
     
-    # --- MÁQUINA DE ESTADOS (MEMORIA TEMPORAL) ---
-    # Sirve para manejar la desincronización y los efectos de transiciones entre cuadros de video
-    ultimo_sync_leido = -1
-    conteo_estabilidad = 0
-    ultimo_cuadro_impreso = -1
+    # --- MÁQUINA DE ESTADOS (MEMORIA TEMPORAL AVANZADA) ---
+    ultimo_paquete_recibido = None
+    conteo_paquetes_identicos = 0
+    ultimo_id_frame_impreso = -1
 
     while True:
         retorno_valido, cuadro = camara.read()
         if not retorno_valido: break
 
         escala_grises = cv2.cvtColor(cuadro, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        escala_grises = clahe.apply(escala_grises)
+        
         marcadores = encontrar_marcadores_fiduciales(escala_grises)
         imagen_depuracion = cuadro.copy()
 
-        # Feedback visual de cuántos marcadores se detectan
         color_puntos = (0, 255, 0) if len(marcadores) >= 4 else (0, 165, 255)
         for (x, y) in marcadores:
             cv2.circle(imagen_depuracion, (int(x), int(y)), 6, color_puntos, -1)
 
-        # Si localiza automáticamente la pantalla (Fase B)
         if len(marcadores) >= 4:
             grilla_rectificada = rectificar_grilla(cuadro, marcadores[:4], tamano_salida=800)
             cv2.imshow("Grilla Rectificada y Corregida", cv2.resize(grilla_rectificada, (500, 500)))
             
             try:
-                # Recibimos la matriz de bits útiles y el bit indicador de cuadro
                 bits_recibidos, bit_sincronizacion = extraer_y_decodificar(grilla_rectificada, detallado=False)
                 
-                # LOGICA ANTIRREBOTE: Espera a que la lectura sea la misma consecutivamente
-                # Esto es vital para lidiar con el 'motion blur' (desenfoque por movimiento del monitor)
-                if bit_sincronizacion == ultimo_sync_leido:
-                    conteo_estabilidad += 1
+                # --- NUEVA LOGICA ANTIRREBOTE (Filtro de Rolling Shutter) ---
+                # Comparamos si TODOS los bits recibidos son exactamente iguales a la captura anterior
+                if ultimo_paquete_recibido is not None and np.array_equal(bits_recibidos, ultimo_paquete_recibido):
+                    conteo_paquetes_identicos += 1
                 else:
-                    ultimo_sync_leido = bit_sincronizacion
-                    conteo_estabilidad = 0 # El cuadro acaba de cambiar o hubo ruido, reiniciamos
+                    ultimo_paquete_recibido = bits_recibidos.copy()
+                    conteo_paquetes_identicos = 0
 
-                # Si ya lleva 3 frames capturados con datos estables y ese cuadro aún no se imprime:
-                if conteo_estabilidad >= 3 and bit_sincronizacion != ultimo_cuadro_impreso:
-                    mensaje_actual = bits_a_texto(bits_recibidos)
-                    mensaje_limpio = mensaje_actual.replace("?", "").strip()
+                # --- NUEVA MÁQUINA DE ESTADOS DE CAPA 2 ---
+                # Validamos solo si hemos visto exactamente el mismo cuadro de bits 2 veces extra
+                # (Asegura que superamos la franja híbrida del rolling shutter)
+                if conteo_paquetes_identicos >= 2:
+                    trama_valida, id_frame, total_frames, es_ultimo, mensaje_limpio = procesar_trama(bits_recibidos)
                     
-                    if len(mensaje_limpio) > 0:
-                        # Imprimir en consola de corrido, armando el mensaje en tiempo real
-                        print(mensaje_limpio, end=" ", flush=True)
-                        ultimo_cuadro_impreso = bit_sincronizacion # Marca este cuadro para no repetirlo
+                    # Validación de cabecera: blindaje extra contra ruido que pase los filtros
+                    if trama_valida and total_frames > 0 and id_frame < total_frames:
+                        
+                        # Si el paquete es legítimo y su ID es diferente al ÚLTIMO QUE IMPRIMIMOS
+                        if id_frame != ultimo_id_frame_impreso:
+                            ultimo_id_frame_impreso = id_frame 
+                            
+                            if id_frame == 0:
+                                print("\n\n[INICIO DE TRANSMISION DETECTADO]")
+                                
+                            if len(mensaje_limpio) > 0:
+                                print(mensaje_limpio, end="", flush=True)
+                                
+                            if es_ultimo == 1:
+                                print("\n[FIN DE MENSAJE. ESPERANDO NUEVO BUCLE...]")
+                                # --- ELIMINAR O COMENTAR LA LÍNEA INFERIOR ---
+                                # ultimo_id_frame_impreso = -1
                 
-                estado_texto = f"BIT_SYNC: {bit_sincronizacion} | ESTABILIDAD: {conteo_estabilidad}"
+                estado_texto = f"ID: {ultimo_id_frame_impreso} | ESTABILIDAD: {conteo_paquetes_identicos}"
                 cv2.putText(imagen_depuracion, estado_texto, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                 
             except Exception as e:
-                pass # Si ocurre un error esporádico decodificando (por brillo súbito, manos, etc) se ignora
+                pass 
         else:
             cv2.putText(imagen_depuracion, f"BUSCANDO PANTALLA... ({len(marcadores)}/4 esquinas)", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
             try: cv2.destroyWindow("Grilla Rectificada y Corregida")
             except: pass
 
-        # Visualizar lo que percibe el receptor
         cv2.imshow("Receptor VLC", imagen_depuracion)
 
-        # Cerrar el proceso de forma segura presionando 'q'
         if cv2.waitKey(1) & 0xFF == ord('q'):
             print("\n\n--- Conexión finalizada por el usuario ---")
             break
