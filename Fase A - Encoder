@@ -68,87 +68,143 @@ def codificar_manchester(bits: np.ndarray):
 
     return simbolos_manchester
 
+def codificar_4ask(bits: np.ndarray) -> np.ndarray:
+    """
+    Mapeo a símbolos 4-ASK (Multinivel): Agrupa los bits de 2 en 2 y les asigna 
+    uno de los 4 niveles de intensidad de gris físico (0, 85, 170, 255).
+    """
+    # Padding de seguridad: Garantizar que la cantidad de bits sea par
+    if len(bits) % 2 != 0:
+        bits = np.pad(bits, (0, 1), 'constant', constant_values=0)
+
+    # Reestructuración matricial: Agrupar la tira plana en pares (2 columnas)
+    bits_agrupados = bits.reshape(-1, 2)
+
+    # Conversión de Binario a Decimal (Vectorizada)
+    # Toma la columna 0 (Bit más significativo) y la columna 1 (Bit menos significativo)
+    valores_enteros = bits_agrupados[:, 0] * 2 + bits_agrupados[:, 1]
+
+    # Mapeo a escala de grises de 8 bits (0 a 255)
+    # Multiplicar el valor lógico (0, 1, 2, 3) por 85 para escalar la luz
+    simbolos_4ask = (valores_enteros * 85).astype(np.uint8)
+
+    return simbolos_4ask
+
 def crear_marcador_fiducial(tamano_marcador: int):
     """Crea un patrón tipo 'finder' similar a los códigos QR para la detección de esquinas."""
 
-    # Crea una matriz cuadrada rellena de ceros (negro)
-    marcador = np.zeros((tamano_marcador, tamano_marcador), dtype=np.uint8)
+    # Crea una matriz cuadrada rellena de 1's (blanco)
+    marcador = np.ones((tamano_marcador, tamano_marcador), dtype=np.uint8)
 
     # Modifica desde la fila 1 hasta la penúltima (-1), y desde la columna 1 hasta la penúltima (-1)
-    # Crea un cuadrado blanco rodeado de negro
-    marcador[1:-1, 1:-1] = 1 # frame blanco interior
-    # Modifica desde la fila 2 hasta la antepenúltima (-2), y desde la columna 2 hasta la antepenúltima (-2)
     # Crea un cuadrado negro rodeado de blanco
-    marcador[2:-2, 2:-2] = 0 # Centro negro
+    marcador[1:-1, 1:-1] = 0 # frame negro interior
+    # Modifica desde la fila 2 hasta la antepenúltima (-2), y desde la columna 2 hasta la antepenúltima (-2)
+    # Crea un cuadrado blanco rodeado de negro
+    marcador[2:-2, 2:-2] = 1 # Centro blanco
+
+    marcador[3:-3, 3:-3] = 0
 
     # Esto crea un patron de cuadrados facilmente identificable
     return marcador
 
-def ensamblar_grilla(simbolos_manchester: np.ndarray, indice_frame: int = 0, filas_grilla: int = 40, columnas_grilla: int = 40) -> np.ndarray:
-    # Se crea una matriz del tamaño 40x40 rellena de ceros para ser de lienzo para cada frame
+def ensamblar_grilla(simbolos: np.ndarray, indice_frame: int = 0, filas_grilla: int = 40, columnas_grilla: int = 40, esquema: str = 'OOK'):
     grilla = np.zeros((filas_grilla, columnas_grilla), dtype=np.uint8)
-    # Tamaño del marcador 7x7
     tamano_marcador = 7
-    # Se crean el marcador fiducial
     marcador = crear_marcador_fiducial(tamano_marcador)
     
-    # Se ubican los marcadores fiduciales en las 4 esquinas:
-    grilla[0:tamano_marcador, 0:tamano_marcador] = marcador # Esquina superior izquierda
-    grilla[0:tamano_marcador, columnas_grilla-tamano_marcador:columnas_grilla] = marcador # Esquina superior Derecha
-    grilla[filas_grilla-tamano_marcador:filas_grilla, 0:tamano_marcador] = marcador # Esquina inferior izquierda
-    grilla[filas_grilla-tamano_marcador:filas_grilla, columnas_grilla-tamano_marcador:columnas_grilla] = marcador # Esquina inferior Derecha
-    
-    # Celdas piloto de calibración
-    grilla[tamano_marcador+1, 0] = 1 
+    # Adaptación física del marcador para 4-ASK
+    if esquema == '4-ASK':   
+        marcador = marcador * 255
+        
+    # 1. COLOCAR MARCADORES FIDUCIALES (Idénticos para ambos esquemas)
+    grilla[0:tamano_marcador, 0:tamano_marcador] = marcador 
+    grilla[0:tamano_marcador, columnas_grilla-tamano_marcador:columnas_grilla] = marcador 
+    grilla[filas_grilla-tamano_marcador:filas_grilla, 0:tamano_marcador] = marcador 
+    grilla[filas_grilla-tamano_marcador:filas_grilla, columnas_grilla-tamano_marcador:columnas_grilla] = marcador 
+
+    # 2. INYECCIÓN DE PILOTOS DE CALIBRACIÓN
+    valor_blanco = 1 if esquema == 'OOK' else 255
+    grilla[tamano_marcador+1, 0] = valor_blanco 
     grilla[tamano_marcador+1, 1] = 0 
-    # bit de sincronización - reloj. Varía entre negro y blanco -> indica cambio de frame
-    grilla[tamano_marcador+1, 2] = 1 if indice_frame % 2 == 0 else 0
+    grilla[tamano_marcador+1, 2] = valor_blanco if indice_frame % 2 == 0 else 0
     
-    # Genera un mapa de puntos disponibles para poner los bits de la data codificada
-
-    # Crea una matriz también de 40x40 llena de 1's = TRUE para indicar lugar disponible
+    if esquema == '4-ASK':
+        grilla[tamano_marcador+1, 3] = 85   # Piloto Gris Oscuro
+        grilla[tamano_marcador+1, 4] = 170  # Piloto Gris Claro
+    
+    # 3. MÁSCARA DE PROTECCIÓN GEOMÉTRICA (Bifurcada por esquema)
     mascara_disponible = np.ones((filas_grilla, columnas_grilla), dtype=bool)
-    # Pone 0's = FALSE en los sitios de los marcadores fiduciales, celdas piloto y bit de sincronización
-    mascara_disponible[0:tamano_marcador+2, 0:tamano_marcador+2] = False 
-    mascara_disponible[0:tamano_marcador+1, columnas_grilla-tamano_marcador-1:columnas_grilla] = False 
-    mascara_disponible[filas_grilla-tamano_marcador-1:filas_grilla, 0:tamano_marcador+1] = False 
-    mascara_disponible[filas_grilla-tamano_marcador-1:filas_grilla, columnas_grilla-tamano_marcador-1:columnas_grilla] = False
     
-    # Entrega coordenadas de cada espacio disponible (filas, columnas)
+    if esquema == '4-ASK':
+        # MÁSCARA 4-ASK: Blindaje estricto de la Fila 8 completa
+        mascara_disponible[0:tamano_marcador, 0:tamano_marcador] = False 
+        mascara_disponible[tamano_marcador + 1, :] = False
+        mascara_disponible[0:tamano_marcador, columnas_grilla-tamano_marcador:] = False 
+        mascara_disponible[filas_grilla-tamano_marcador:, 0:tamano_marcador] = False 
+        mascara_disponible[filas_grilla-tamano_marcador:, columnas_grilla-tamano_marcador:] = False
+    else:
+        # MÁSCARA OOK ORIGINAL: Envuelve el espacio sobrante alrededor de los 3 pilotos
+        mascara_disponible[0:tamano_marcador+2, 0:tamano_marcador+2] = False 
+        mascara_disponible[0:tamano_marcador+1, columnas_grilla-tamano_marcador-1:columnas_grilla] = False 
+        mascara_disponible[filas_grilla-tamano_marcador-1:filas_grilla, 0:tamano_marcador+1] = False 
+        mascara_disponible[filas_grilla-tamano_marcador-1:filas_grilla, columnas_grilla-tamano_marcador-1:columnas_grilla] = False
+    
     indices_disponibles = np.where(mascara_disponible)
-    
-    # Balancea los pixeles entre negro y blanco (1 y 0) para frames con falta de texto
-
-    # Cantidad de espacios disponibles (Para la configuración actual es 1316)
     espacios_totales = len(indices_disponibles[0])
-    # pongo 0's en los espacios disponibles
+    
+    # 4. RELLENO DE ESPACIOS VACÍOS
     patron_relleno = np.zeros(espacios_totales, dtype=np.uint8)
-    # pongo 1's en las posiciones pares
-    patron_relleno[0::2] = 1 # Rellena con 1, 0, 1, 0 para balancear brillo
+    if esquema == 'OOK':
+        patron_relleno[0::2] = 1 # Rellena con 1, 0, 1, 0 para balancear brillo en OOK
+    elif esquema == '4-ASK':
+        patron_relleno[:] = 0    # Rellena con negro absoluto lícito para 4-ASK
     
-    # Sobreescribe el inicio del relleno con los datos codificados
-    patron_relleno[:len(simbolos_manchester)] = simbolos_manchester
-    
-    # Inyecta los datos codificados en la matriz final
+    # Inyectar los símbolos reales del mensaje sobre el lienzo de relleno
+    patron_relleno[:len(simbolos)] = simbolos
     grilla[indices_disponibles[0], indices_disponibles[1]] = patron_relleno
     
     return grilla
 
-def renderizar_frame(grilla: np.ndarray, tamano_celda_px: int = 20):
-    """Escala la matriz lógica (1s y 0s) a macropíxeles en una imagen en escala de grises."""
-
-    #matriz de píxeles en escala de grises de 800 x 800. Con tamaño de celda de 20 
-    grilla_pixeles = grilla * 255 # Convertir binario a blanco (255) y negro (0)
-    # Expandir cada celda al tamaño deseado usando el producto de Kronecker
+def renderizar_frame(grilla: np.ndarray, tamano_celda_px: int = 20, esquema: str = 'OOK'):
+    """Escala la matriz a macropíxeles. Soporta OOK (lógico) y 4-ASK (físico)."""
+    if esquema == 'OOK':
+        grilla_pixeles = grilla * 255 # Escala binario puro a blanco/negro
+    else:
+        grilla_pixeles = grilla # 4-ASK ya viene pre-escalado (0, 85, 170, 255)
+        
     return np.kron(grilla_pixeles, np.ones((tamano_celda_px, tamano_celda_px), dtype=np.uint8))
 
 if __name__ == "__main__":
+
+    print("             CONFIGURACIÓN DEL TRANSMISOR               ")
+    print("Escoja la modulación:")
+    print("1. OOK")
+    print("2. 4-ASK")
+    
+    opcion = input("\nIngrese el número de su elección (1 o 2): ").strip()
+    
+    while opcion not in ['1', '2']:
+        print("Error: Opción no válida. Por favor ingrese 1 o 2.")
+        opcion = input("Ingrese el número de su elección (1 o 2): ").strip()
+        
+    # Asignación de la cadena según la elección
+    if(opcion == '1'):
+        ESQUEMA_MODULACION = "OOK"
+    else:
+        ESQUEMA_MODULACION = "4-ASK"
+
     mensaje_prueba = "La serie final de la nba entre los spurs de san antonio y los knicks de nueva york en mil novecientos noventa y nueve es legendaria. Fue un duelo intenso que definio el destino de dos franquicias historicas. Los spurs liderados por tim duncan y david robinson mostraron una defensa impecable mientras los knicks luchaban con coraje bajo la direccion de patrick ewing. Al final san antonio se corono campeon demostrando su gran dominio en la duela tras ganar cinco juegos para el titulo."
     
     # Dimensionamiento del canal
     celdas_utiles_por_frame = 1316
 
-    bits_totales_por_frame = int((celdas_utiles_por_frame / 2) * (4 / 7)) # 376 bits de datos para la configuración actual
+    if ESQUEMA_MODULACION == "OOK":
+        bits_protegidos_maximos = celdas_utiles_por_frame / 2
+    elif ESQUEMA_MODULACION == "4-ASK":
+        bits_protegidos_maximos = celdas_utiles_por_frame * 2
+
+    bits_totales_por_frame = int(bits_protegidos_maximos * (4 / 7)) # 376 bits de datos para la configuración actual
     bits_cabecera = 32 # 4 bytes de protocolo (Preámbulo, ID, Total, Fin)
     bits_payload_por_frame = bits_totales_por_frame - bits_cabecera # 344 bits
     caracteres_por_frame = bits_payload_por_frame // 8 # 43 caracteres exactos por imagen ___ por 8 bits por caracter
@@ -199,9 +255,15 @@ if __name__ == "__main__":
             
             # Codificación
             bits_protegidos = codificar_hamming(bits_trama_completa)
-            simbolos_manchester = codificar_manchester(bits_protegidos)
-            grilla_logica = ensamblar_grilla(simbolos_manchester, indice_frame=i)
-            frame_final = renderizar_frame(grilla_logica, tamano_celda_px=20)
+            
+            # Switch inteligente según lo que elegiste en el menú
+            if ESQUEMA_MODULACION == "OOK":
+                simbolos_opticos = codificar_manchester(bits_protegidos)
+            elif ESQUEMA_MODULACION == "4-ASK":
+                simbolos_opticos = codificar_4ask(bits_protegidos)
+            
+            grilla_logica = ensamblar_grilla(simbolos_opticos, indice_frame=i, esquema=ESQUEMA_MODULACION)
+            frame_final = renderizar_frame(grilla_logica, tamano_celda_px=20, esquema=ESQUEMA_MODULACION)
             
             filename = f"frame_{i}.png"
             cv2.imwrite(filename, frame_final)
